@@ -17,8 +17,18 @@ EBAY_PASSWORD = os.getenv("EBAY_PASSWORD")
 
 
 def parse_time_left(text: str) -> int | None:
-    """Convert eBay 'time left' text like '2d 3h', '4h 23m', '12m 34s' into seconds."""
-    text = text.lower().strip()
+    """Convert eBay time text into seconds. Handles '2d 3h', '4h 23m', '12m 34s', 'HH:MM:SS'."""
+    text = text.strip()
+
+    # HH:MM:SS or MM:SS live countdown format
+    colon = re.search(r"(\d+):(\d{2}):(\d{2})", text)
+    if colon:
+        return int(colon.group(1)) * 3600 + int(colon.group(2)) * 60 + int(colon.group(3))
+    mmss = re.search(r"(\d+):(\d{2})$", text.strip())
+    if mmss:
+        return int(mmss.group(1)) * 60 + int(mmss.group(2))
+
+    text = text.lower()
     total = 0
     days = re.search(r"(\d+)\s*d", text)
     hours = re.search(r"(\d+)\s*h", text)
@@ -57,7 +67,23 @@ async def get_current_price(page) -> float | None:
 
 
 async def get_time_left_seconds(page) -> int | None:
-    # eBay UK time-left selectors — adjust if eBay redesigns
+    # Primary: scan page text for "Ends in Xd Xh" / "Ends in Xh Xm" etc.
+    try:
+        raw = await page.evaluate(r"""
+            () => {
+                const text = document.body.innerText;
+                const m = text.match(/Ends\s+in\s+((?:\d+\s*[dhms]\s*)+|\d+:\d{2}:\d{2}|\d+:\d{2})/i);
+                return m ? m[1] : null;
+            }
+        """)
+        if raw:
+            seconds = parse_time_left(raw)
+            if seconds is not None:
+                return seconds
+    except Exception:
+        pass
+
+    # Fallback: known eBay countdown element IDs/classes
     for selector in [
         "#vi-cdown_btn",
         ".vi-countdown",
@@ -75,17 +101,6 @@ async def get_time_left_seconds(page) -> int | None:
                     return seconds
         except Exception:
             continue
-
-    # Fallback: find any element containing time-left pattern
-    try:
-        els = await page.locator("text=/\\d+[dhm]\\s*\\d+[hms]/i").all()
-        for el in els:
-            text = await el.inner_text()
-            seconds = parse_time_left(text)
-            if seconds is not None:
-                return seconds
-    except Exception:
-        pass
 
     return None
 
@@ -107,25 +122,28 @@ async def login(page) -> None:
     except PlaywrightTimeout:
         pass
 
-    # Handle 2FA / security check
-    if any(x in page.url for x in ["challenge", "verify", "2fa", "otp"]):
-        print("[login] 2FA required — complete it in the browser window (2 min timeout).")
+    # Handle 2FA / security check / post-login account prompts (authn-register, acctsec, etc.)
+    blocked_paths = ["challenge", "verify", "2fa", "otp", "authn-register", "acctsec"]
+    if any(x in page.url for x in blocked_paths):
+        print(f"[login] Post-login prompt detected — please complete or dismiss it in the browser window (2 min timeout).")
         try:
             await page.wait_for_function(
-                "() => window.location.href.includes('ebay.co.uk') && !window.location.href.includes('signin')",
+                "() => !['challenge','verify','2fa','otp','authn-register','acctsec']"
+                ".some(x => window.location.href.includes(x))",
                 timeout=120_000,
             )
         except PlaywrightTimeout:
-            print("[login] Timed out waiting for 2FA. Exiting.")
+            print("[login] Timed out waiting for post-login prompt. Exiting.")
             sys.exit(1)
 
-    print(f"[login] Signed in. Current page: {page.url}")
+    print("[login] Signed in successfully.")
 
 
 async def place_bid(page, amount: float) -> None:
     print(f"[bid] Firing bid of £{amount:.2f} at {datetime.now():%H:%M:%S}...")
     await page.goto(ITEM_URL)
-    await page.wait_for_load_state("domcontentloaded")
+    await page.wait_for_load_state("load", timeout=30_000)
+    await page.wait_for_timeout(1000)
 
     # Find bid input
     bid_input = None
@@ -163,7 +181,7 @@ async def place_bid(page, amount: float) -> None:
         print("[bid] No confirmation page encountered — bid may have been placed directly.")
 
     await page.screenshot(path="bid_result.png")
-    print(f"[bid] Done. Screenshot saved to bid_result.png")
+    print("[bid] Done. Screenshot saved to bid_result.png")
 
 
 async def monitor_and_snipe(page) -> None:
@@ -174,10 +192,19 @@ async def monitor_and_snipe(page) -> None:
 
     while True:
         await page.goto(ITEM_URL)
-        await page.wait_for_load_state("domcontentloaded")
+        await page.wait_for_load_state("load", timeout=30_000)
+        await page.wait_for_timeout(2000)  # let JS countdown render
 
         price = await get_current_price(page)
-        seconds_left = await get_time_left_seconds(page)
+
+        # Retry up to 3 times if the countdown hasn't rendered yet
+        seconds_left = None
+        for _ in range(3):
+            seconds_left = await get_time_left_seconds(page)
+            if seconds_left is not None:
+                break
+            await page.wait_for_timeout(2000)
+
         now_str = datetime.now().strftime("%H:%M:%S")
 
         if price is not None and price >= MAX_BID:
@@ -185,7 +212,7 @@ async def monitor_and_snipe(page) -> None:
             return
 
         if seconds_left is None:
-            print(f"[{now_str}] Could not read time left. Retrying in 30s...")
+            print(f"[{now_str}] Could not read time left after retries. Retrying in 30s...")
             await asyncio.sleep(30)
             continue
 
@@ -221,7 +248,7 @@ async def main() -> None:
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=False,  # keep visible so you can see what's happening + handle 2FA
+            headless=False,  # keep visible so you can see what's happening + handle prompts
         )
         context = await browser.new_context(
             user_agent=(
